@@ -1,0 +1,163 @@
+# Databricks notebook source
+
+from pyspark.sql.functions import lit, col, array, when, array_remove, size, concat, isnull, concat_ws, row_number, dense_rank
+from pyspark.sql.window import Window
+
+
+# COMMAND ----------
+
+
+
+# COMMAND ----------
+
+#Declaring if first file for comparison is a jon of 2 files
+dbutils.widgets.dropdown("number_of_files", "False", ["True", "False"] , "Is first comparison a combination of 2 files")
+dropdown_option_if_1st_file_is_combination = dbutils.widgets.get("number_of_files")
+print(dropdown_option_if_1st_file_is_combination)
+
+dbutils.widgets.text("file_name_1", "/mnt/blob/lp/landing-zone-veeva-unrefined-prod/adhoc_req/AMA/Account (Veeva Salesforce AMA)/", "Please enter file path of 1st comparison")
+print(dbutils.widgets.get('file_name_1'))
+
+
+if dropdown_option_if_1st_file_is_combination == 'True': 
+  dbutils.widgets.text("file_name_2", "/mnt/blob/lp/landing-zone-veeva-unrefined-prod/event/AMA/Account (Veeva Salesforce AMA)/", "Please enter 2nd file path here for first comparison(if first comparison is a combination of more files)")
+  print(dbutils.widgets.get('file_name_2'))
+
+# COMMAND ----------
+
+print(dbutils.widgets.get('file_name_1'))
+print(dbutils.widgets.get('file_name_2'))
+
+# COMMAND ----------
+
+#Reading first file from landing zone
+first_file  = dbutils.widgets.get('file_name_1')
+df_landing_adhoc = spark.read.parquet(first_file)
+
+# COMMAND ----------
+
+#Reading second file if the first comparison is a combination
+if dropdown_option_if_1st_file_is_combination == 'True':
+  second_file = dbutils.widgets.get('file_name_2')
+  df_landing_event = spark.read.parquet(second_file)
+
+# COMMAND ----------
+
+#reading second default comparison
+df_unrefined = spark.sql('SELECT * FROM unrefined_veeva_ama_prod.account').distinct()
+
+
+
+# COMMAND ----------
+
+#Opening SQL serve session to see available tables for comparison
+class SQLconnect(object):
+    def __init__(self):
+      SQLport = 1433
+      SQLhostname = "sqlserver-cdh-launchpad-hc-01dv.database.windows.net"
+      SQLdatabase = "sqldb-cdh-launchpad-hc-01dv"
+      SQLusername = dbutils.secrets.get(scope="blob-hc-databricks", key="sqldb-cdh-launchpad-hc-01dv-user")
+      SQLpassword = dbutils.secrets.get(scope="blob-hc-databricks", key="sqldb-cdh-launchpad-hc-01dv-password")
+      # connection url
+      url = "jdbc:sqlserver://{0}:{1};database={2}".format(SQLhostname, SQLport, SQLdatabase)
+      # connection properties
+      properties = {"user" : SQLusername,
+                    "password" : SQLpassword,
+                    "driver" : "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+      }
+      # access details
+      self.details = {"hostname": SQLhostname,
+                      "port": SQLport,
+                      "database": SQLdatabase,
+                      "username" : SQLusername,
+                      "password" : SQLpassword,
+                      "url" : url,
+                      "properties" : properties
+        }
+    def __call__(self, parameter):
+        return self.types.get(parameter)
+      
+def SQLconnector(connection):
+  driver_manager = spark._sc._gateway.jvm.java.sql.DriverManager
+  con = driver_manager.getConnection(connection.details['url'], connection.details['username'], connection.details['password'])
+  return con
+
+SQLconnection = SQLconnect()
+
+
+con = SQLconnector(SQLconnection)
+SQLtable = "metadata.veeva_ddapi_objects"
+table_df = spark.read.jdbc(url = SQLconnection.details['url'], table = SQLtable, properties = SQLconnection.details['properties']).toPandas().reset_index(drop=True)
+con.close()
+display(table_df)
+
+# COMMAND ----------
+
+listt = []
+for i in table_df['table_name']:
+  listt.append(i)
+print(listt)
+
+# COMMAND ----------
+
+#making a widget for second comparison
+dbutils.widgets.dropdown("2nd comparison", "Address_vod__c", [str(i) for i in table_df['table_name']], "Please choose 2nd comparison")
+print(dbutils.widgets.get('2nd comparison'))
+
+# COMMAND ----------
+
+#Combining 2 files from landing zone if there are two files
+if dropdown_option_if_1st_file_is_combination == 'True':
+  df_landing_combined = df_landing_adhoc.unionAll(df_landing_event)
+  df_landing_combined.count()
+else:
+  df_landing_combined = df_landing_adhoc
+
+
+  
+
+# COMMAND ----------
+
+#removing duplicates with window func
+windowSpec  = Window.partitionBy("Id").orderBy(col("SystemModstamp").desc())             
+
+df_landing_combined_window_func = df_landing_combined.withColumn('dense_rank', dense_rank().over(windowSpec)).filter(col('dense_rank') == 1)
+df_landing_combined_window_func.count()
+
+display(df_landing_combined_window_func)
+
+# COMMAND ----------
+
+# This sell is for a check for a pecific case
+display(df_landing_combined_window_func.filter(df_landing_combined_window_func['Id']=='0014K00000HHrwDQAT'))
+
+# COMMAND ----------
+
+#Comparing data from landing and unrefined zone, with window func
+comparisons_ = [when(df_unrefined[c]!=df_landing_combined_window_func[c], concat(lit("ORG:"),df_unrefined[c],lit("\nNEW:"),df_landing_combined_window_func[c])).when(df_unrefined[c].isNull() & df_landing_combined_window_func[c].isNotNull(), concat(lit("ORG: null"),lit("\nNEW:"),df_landing_combined_window_func[c])).when(df_unrefined[c].isNotNull() & df_landing_combined_window_func[c].isNull(), concat(lit("ORG:"),df_unrefined[c],lit("\nNEW: null"))).otherwise(df_unrefined[c]).alias(c) for c in df_unrefined.columns if c != 'Id']
+conditions_ = [when(df_unrefined[c]!=df_landing_combined_window_func[c], lit(c)).when(df_unrefined[c].isNull() & df_landing_combined_window_func[c].isNotNull(), lit(c)).when(df_unrefined[c].isNotNull() & df_landing_combined[c].isNull(), lit(c)).otherwise("") for c in df_unrefined.columns if c != 'Id']
+
+select_expr =[
+                df_unrefined['Id'],
+                *comparisons_,
+                concat_ws("|", array_remove(array(*conditions_), "")).alias("diff_column_names"),
+]
+
+dfs_compared_with_window_function = df_unrefined.join(df_landing_combined_window_func, [df_unrefined.Id == df_landing_combined_window_func.Id]).select(*select_expr).sort([df_unrefined.Id])
+
+# COMMAND ----------
+
+display(dfs_compared_with_window_function)
+
+# COMMAND ----------
+
+display(dfs_compared_with_window_function.filter(dfs_compared_with_window_function['diff_column_names']!=''))
+
+# COMMAND ----------
+
+
+
+# COMMAND ----------
+
+
+
